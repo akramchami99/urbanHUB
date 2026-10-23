@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "urbanhub-common"
+version = "0.1.0"
+description = "UrbanHub: MinIO object lake and in-memory DuckDB analytics"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb==1.4.3",
+    "pyiceberg[pyarrow,s3fs,pyiceberg-core]==0.10.0",
+    "boto3==1.43.117",
+    "python-dotenv>=1.0",
+    "pandas>=2.2,<3",
+    "pyarrow>=18,<25",
+]
+
+[tool.setuptools]
+packages = ["urbanhub_common"]
+
+[tool.setuptools.package-data]
+urbanhub_common = ["sql/*.sql"]

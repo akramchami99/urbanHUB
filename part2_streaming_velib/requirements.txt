@@ -1,0 +1,6 @@
+requests>=2.32,<3
+boto3>=1.35,<2
+pandas>=2.2,<3
+pyarrow>=18,<25
+python-dotenv>=1.0,<2
+matplotlib>=3.9,<4

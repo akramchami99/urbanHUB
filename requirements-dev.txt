@@ -1,0 +1,7 @@
+-e ./shared
+pytest>=8
+moto[s3]>=5,<6
+requests>=2.32
+
+# Ephemeral test catalog only; production uses Nessie REST.
+pyiceberg[sql-sqlite]==0.10.0

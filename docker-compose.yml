@@ -1,0 +1,192 @@
+# =====================================================================
+# UrbanHub - orchestration des services
+# Data lake : MinIO local (S3). DuckDB en mémoire : lecture des fichiers pour le dashboard.
+#
+#   docker compose --profile batch run --rm batch-meteo    # 2. partie 1 : batch météo (une fois, ~15 min)
+#   docker compose --profile meteo up -d --build           # 2. partie 1 : mise à jour météo horaire
+#   docker compose --profile streaming up -d --build       # 2. partie 2 : flux streaming vélos
+#   docker compose --profile iot up -d --build             # 2. partie 3 : flux IoT pollution
+#   docker compose --profile dashboard up -d --build       # 3. tableau de bord  -> http://localhost:8501
+#   docker compose --profile notebook up -d --build        #    notebooks Jupyter -> http://localhost:8888
+#   docker compose --profile all up -d --build             # tout (sauf migration)
+# =====================================================================
+
+x-common: &common
+  env_file: .env
+  restart: unless-stopped
+  environment: &lake-env
+    S3_ENDPOINT_URL: http://minio:9000
+    S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+    S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+    S3_REGION: ${S3_REGION:-us-east-1}
+    S3_BUCKET: ${S3_BUCKET:-urbanhub}
+    RAW_STORAGE: minio
+    LAKE_TABLE_FORMAT: iceberg
+    ICEBERG_CATALOG_URI: http://nessie:19120/iceberg
+  depends_on:
+    nessie:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  nessie-permissions:
+    image: alpine:3.22
+    restart: "no"
+    volumes: ["nessie-data:/nessie/data"]
+    command: ["chown", "10000:10001", "/nessie/data"]
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.106.0
+    restart: unless-stopped
+    environment:
+      JAVA_OPTS_APPEND: "-Xms128m -Xmx768m"
+      NESSIE_VERSION_STORE_TYPE: ROCKSDB
+      NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH: /nessie/data
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: urbanhub
+      NESSIE_CATALOG_WAREHOUSES_URBANHUB_LOCATION: s3://${S3_BUCKET:-urbanhub}/iceberg/
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: ${S3_REGION:-us-east-1}
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://minio:9000
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY: urn:nessie-secret:quarkus:lake
+      LAKE_NAME: ${MINIO_ROOT_USER}
+      LAKE_SECRET: ${MINIO_ROOT_PASSWORD}
+    ports: ["127.0.0.1:19120:19120"]
+    volumes: ["nessie-data:/nessie/data"]
+    depends_on:
+      nessie-permissions:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/q/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  minio:
+    image: urbanhub-minio:RELEASE.2025-10-15T17-29-55Z
+    build: { context: ., dockerfile: docker/minio.Dockerfile }
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+    ports: ["127.0.0.1:${MINIO_API_PORT:-9002}:9000", "127.0.0.1:9001:9001"]
+    volumes: ["minio-data:/data"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: urbanhub-analysis
+    build: { context: ., dockerfile: docker/analysis.Dockerfile }
+    restart: "no"
+    env_file: .env
+    environment: *lake-env
+    depends_on:
+      minio:
+        condition: service_healthy
+    command: ["python", "-m", "urbanhub_common", "init"]
+
+  lake-gold:
+    <<: *common
+    image: urbanhub-analysis
+    build: { context: ., dockerfile: docker/analysis.Dockerfile }
+    profiles: ["analysis"]
+    restart: "no"
+    command: ["python", "-m", "urbanhub_common", "gold", "--days", "7"]
+
+
+  # --- Partie 1 : flux batch météo ----------------------------------------
+  # Job batch NOAA (2022-2025) + complément Open-Meteo : s'exécute puis s'arrête.
+  #   docker compose --profile batch run --rm batch-meteo            (run = noaa + openmeteo)
+  batch-meteo:
+    <<: *common
+    build: { context: ., dockerfile: part1_batch_meteo/Dockerfile }
+    image: urbanhub-batch-meteo
+    profiles: ["batch"]
+    restart: "no"
+    command: ["run"]
+    volumes:
+      - ./data/noaa:/app/data/noaa     # cache NOAA ; les fichiers sont archivés dans MinIO Bronze
+
+  # Mise à jour horaire Open-Meteo, pour croiser la météo avec les flux temps réel (partie 4)
+  meteo-live:
+    <<: *common
+    image: urbanhub-batch-meteo
+    build: { context: ., dockerfile: part1_batch_meteo/Dockerfile }
+    profiles: ["meteo", "all"]
+    command: ["live"]
+
+  # --- Partie 2 : flux streaming CityBikes --------------------------------
+  # Collecte toutes les 3 min -> MinIO Bronze/Silver ; vues dashboard calculées sur les fichiers.
+  # Analyse gold à la demande :
+  #   docker compose --profile streaming run --rm streaming-velib --analyze --days 2
+  streaming-velib:
+    <<: *common
+    build: { context: ., dockerfile: part2_streaming_velib/Dockerfile }
+    image: urbanhub-streaming-velib
+    profiles: ["streaming", "all"]
+    command: ["--interval", "180"]
+
+  # --- Partie 3 : flux IoT pollution OpenAQ ------------------------------
+  iot-pollution:
+    <<: *common
+    build: { context: ., dockerfile: part3_iot_pollution/Dockerfile }
+    image: urbanhub-iot-pollution
+    profiles: ["iot", "all"]
+    command: ["run"]
+    volumes:
+      - ./data/raw:/app/data/raw     # utilisé si RAW_STORAGE=local
+
+  # --- Partie 4 : analyse croisée ---------------------------------------------
+  # Charge les archives CityBikes (usage réel des vélos) :
+  #   docker compose --profile analysis run --rm cross-analysis archive --months 202609
+  cross-analysis:
+    <<: *common
+    build: { context: ., dockerfile: docker/analysis.Dockerfile }
+    image: urbanhub-analysis
+    profiles: ["analysis"]
+    restart: "no"
+    working_dir: /app/part4
+    environment:
+      <<: *lake-env
+      PYTHONPATH: /app/part4/src
+    entrypoint: ["python", "-m", "cross_analysis"]
+    volumes:
+      - ./part4_analyse_croisee:/app/part4
+
+  # --- Visualisation ------------------------------------------------------
+  dashboard:
+    <<: *common
+    build: { context: ., dockerfile: docker/analysis.Dockerfile }
+    image: urbanhub-analysis
+    profiles: ["dashboard", "all"]
+    working_dir: /app/dashboard
+    command: ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    ports: ["8501:8501"]
+    volumes:
+      - ./dashboard:/app/dashboard
+
+  jupyter:
+    <<: *common
+    build: { context: ., dockerfile: docker/analysis.Dockerfile }
+    image: urbanhub-analysis
+    profiles: ["notebook", "all"]
+    working_dir: /app/notebooks
+    command: ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root",
+              "--IdentityProvider.token=${JUPYTER_TOKEN:-urbanhub}"]
+    ports: ["8888:8888"]
+    volumes:
+      - ./notebooks:/app/notebooks
+      - ./part1_batch_meteo:/app/notebooks/part1_batch_meteo   # notebook de la partie 1
+
+volumes:
+  minio-data:
+  nessie-data:
